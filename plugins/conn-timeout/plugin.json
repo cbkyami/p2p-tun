@@ -1,0 +1,11 @@
+{
+  "name": "conn-timeout",
+  "version": "1.0",
+  "type": "alerting",
+  "hooks": ["on_open", "on_close", "on_data", "on_check"],
+  "exec": "python3 plugin.py",
+  "enabled": true,
+  "config": {
+    "timeout_seconds": 30
+  }
+}

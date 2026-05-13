@@ -1,0 +1,12 @@
+{
+  "name": "web-access-log",
+  "version": "1.0",
+  "type": "logger",
+  "hooks": ["on_open", "on_close", "on_data"],
+  "exec": "python3 plugin.py",
+  "enabled": true,
+  "config": {
+    "log_file": "web-access.log",
+    "log_format": "combined"
+  }
+}

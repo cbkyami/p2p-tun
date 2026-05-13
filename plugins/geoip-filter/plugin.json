@@ -1,0 +1,12 @@
+{
+  "name": "geoip-filter",
+  "version": "1.0",
+  "type": "filter",
+  "hooks": ["on_accept"],
+  "exec": "python3 plugin.py",
+  "enabled": true,
+  "config": {
+    "database": "GeoLite2-Country.mmdb",
+    "deny_countries": "US"
+  }
+}
