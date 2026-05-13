@@ -7,9 +7,9 @@
 p2p-tun
 p2p-tun.exe
 p2p-tun-linux
-signal-server
-signal-server.exe
-signal-server-linux
+/signal-server
+/signal-server.exe
+/signal-server-linux
 
 # Test binary
 *.test
