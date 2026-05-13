@@ -7,9 +7,6 @@
 p2p-tun
 p2p-tun.exe
 p2p-tun-linux
-/signal-server
-/signal-server.exe
-/signal-server-linux
 
 # Test binary
 *.test
@@ -56,3 +53,16 @@ stress_test.py
 
 # Summary files
 SUMMARY-*.md
+
+# Claude Code
+CLAUDE.md
+
+# Tools (local scripts)
+/tools/
+
+# Signal server binary
+signal-server/signal-server
+
+# Plan docs
+PLAN.md
+PLAN-*.md
