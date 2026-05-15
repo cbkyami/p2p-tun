@@ -41,12 +41,18 @@ func (c *Compression) Compress(data []byte) ([]byte, bool) {
 	return compressed, true
 }
 
+const maxDecompressedSize = 262144
+
 func (c *Compression) Decompress(data []byte) ([]byte, error) {
 	r := lz4.NewReader(bytes.NewReader(data))
 
 	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, r); err != nil {
+	if _, err := io.Copy(&buf, io.LimitReader(r, maxDecompressedSize+1)); err != nil {
 		return nil, fmt.Errorf("decompress: %w", err)
+	}
+
+	if buf.Len() > maxDecompressedSize {
+		return nil, fmt.Errorf("decompress: output exceeds max size %d", maxDecompressedSize)
 	}
 
 	return buf.Bytes(), nil

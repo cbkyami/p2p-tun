@@ -59,10 +59,8 @@ func RecordTraffic() {
 	in := atomic.LoadInt64(&totalBytesIn)
 	out := atomic.LoadInt64(&totalBytesOut)
 
-	inRate := in - lastBytesIn
-	outRate := out - lastBytesOut
-	lastBytesIn = in
-	lastBytesOut = out
+	inRate := in - atomic.SwapInt64(&lastBytesIn, in)
+	outRate := out - atomic.SwapInt64(&lastBytesOut, out)
 
 	point := TrafficPoint{
 		Time:         time.Now().Unix(),

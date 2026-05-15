@@ -61,7 +61,7 @@ func parseXORMappedAddr(attrValue []byte, txnID [12]byte) (*Addr, error) {
 	if len(attrValue) < 4 {
 		return nil, ErrInvalidResponse
 	}
-	family := attrValue[0]
+	family := attrValue[1]
 	xorPort := binary.BigEndian.Uint16(attrValue[2:4])
 	port := xorPort ^ uint16(stunMagicCookie>>16)
 
@@ -71,11 +71,12 @@ func parseXORMappedAddr(attrValue []byte, txnID [12]byte) (*Addr, error) {
 			return nil, ErrInvalidResponse
 		}
 		xorIP := binary.BigEndian.Uint32(attrValue[4:8])
+		decodedIP := xorIP ^ stunMagicCookie
 		ip = net.IPv4(
-			byte(xorIP^stunMagicCookie>>24),
-			byte(xorIP^stunMagicCookie>>16),
-			byte(xorIP^stunMagicCookie>>8),
-			byte(xorIP^stunMagicCookie),
+			byte(decodedIP>>24),
+			byte(decodedIP>>16),
+			byte(decodedIP>>8),
+			byte(decodedIP),
 		)
 	} else if family == familyIPv6 {
 		if len(attrValue) < 20 {
@@ -98,7 +99,7 @@ func parseMappedAddr(attrValue []byte) (*Addr, error) {
 	if len(attrValue) < 4 {
 		return nil, ErrInvalidResponse
 	}
-	family := attrValue[0]
+	family := attrValue[1]
 	port := binary.BigEndian.Uint16(attrValue[2:4])
 
 	var ip net.IP
@@ -106,7 +107,7 @@ func parseMappedAddr(attrValue []byte) (*Addr, error) {
 		if len(attrValue) < 8 {
 			return nil, ErrInvalidResponse
 		}
-		ip = net.IPv4(attrValue[4], attrValue[5], attrValue[6], attrValue[7])
+		ip = net.IP(attrValue[4:8])
 	} else if family == familyIPv6 {
 		if len(attrValue) < 20 {
 			return nil, ErrInvalidResponse
@@ -189,8 +190,14 @@ func BindingRequest(conn *net.UDPConn, stunServer string) (*Addr, error) {
 	if err := conn.SetWriteDeadline(deadline); err != nil {
 		return nil, err
 	}
-	if _, err := conn.WriteToUDP(req, udpAddr); err != nil {
-		return nil, fmt.Errorf("write to stun server: %w", err)
+	if conn.RemoteAddr() != nil {
+		if _, err := conn.Write(req); err != nil {
+			return nil, fmt.Errorf("write to stun server: %w", err)
+		}
+	} else {
+		if _, err := conn.WriteToUDP(req, udpAddr); err != nil {
+			return nil, fmt.Errorf("write to stun server: %w", err)
+		}
 	}
 
 	buf := make([]byte, 1500)
@@ -230,7 +237,7 @@ func BindingRequestWithNewConn(stunServer string) (*Addr, *net.UDPConn, error) {
 	return addr, conn, nil
 }
 
-func DetectNATType(stunServer string) (string, *Addr, *net.UDPConn, error) {
+func DetectNATType(stunServer, stunServer2 string) (string, *Addr, *net.UDPConn, error) {
 	_, err := net.ResolveUDPAddr("udp", stunServer)
 	if err != nil {
 		return "", nil, nil, fmt.Errorf("resolve stun server: %w", err)
@@ -243,7 +250,7 @@ func DetectNATType(stunServer string) (string, *Addr, *net.UDPConn, error) {
 
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 
-	logutil.Debug("stun", "第一次绑定请求到 %s", stunServer)
+	logutil.Debug("stun", "测试1: 向 %s 发送绑定请求", stunServer)
 	addr1, err := BindingRequest(conn, stunServer)
 	if err != nil {
 		conn.Close()
@@ -255,15 +262,14 @@ func DetectNATType(stunServer string) (string, *Addr, *net.UDPConn, error) {
 		return "no-nat", addr1, conn, nil
 	}
 
-	host, _, err := net.SplitHostPort(stunServer)
-	if err != nil {
-		conn.Close()
-		return "", nil, nil, fmt.Errorf("split host port: %w", err)
+	if stunServer2 == "" {
+		logutil.Info("stun", "未提供第二个 STUN 服务器，跳过 NAT 类型精确检测")
+		logutil.Info("stun", "NAT 类型判定: unknown (公网地址: %s)", addr1)
+		return "unknown", addr1, conn, nil
 	}
 
-	altStunServer := fmt.Sprintf("%s:3479", host)
-	logutil.Debug("stun", "第二次绑定请求到 %s", altStunServer)
-	addr2, err := BindingRequest(conn, altStunServer)
+	logutil.Debug("stun", "测试2: 向 %s 发送绑定请求", stunServer2)
+	addr2, err := BindingRequest(conn, stunServer2)
 	if err != nil {
 		logutil.Debug("stun", "第二次绑定请求失败: %v", err)
 		if isLocalPortChanged(addr1, localAddr) {
@@ -274,15 +280,59 @@ func DetectNATType(stunServer string) (string, *Addr, *net.UDPConn, error) {
 		return "port-restricted", addr1, conn, nil
 	}
 
+	if !addr1.IP.Equal(addr2.IP) {
+		logutil.Debug("stun", "两次映射IP不同: %s vs %s", addr1.IP, addr2.IP)
+		logutil.Info("stun", "NAT 类型判定: symmetric (公网地址: %s)", addr1)
+		return "symmetric", addr1, conn, nil
+	}
+
 	if addr1.Port != addr2.Port {
 		logutil.Debug("stun", "两次映射端口不同: %d vs %d", addr1.Port, addr2.Port)
 		logutil.Info("stun", "NAT 类型判定: symmetric (公网地址: %s)", addr1)
 		return "symmetric", addr1, conn, nil
 	}
 
-	logutil.Debug("stun", "两次映射端口相同: %d", addr1.Port)
-	logutil.Info("stun", "NAT 类型判定: full-cone (公网地址: %s)", addr1)
-	return "full-cone", addr1, conn, nil
+	logutil.Debug("stun", "两次映射相同: %s (非Symmetric NAT)", addr1)
+
+	logutil.Debug("stun", "测试3: 从新端口向 %s 发送绑定请求", stunServer)
+	conn2, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		logutil.Info("stun", "NAT 类型判定: port-restricted (公网地址: %s)", addr1)
+		return "port-restricted", addr1, conn, nil
+	}
+	defer conn2.Close()
+
+	addr3, err := BindingRequest(conn2, stunServer)
+	if err != nil {
+		logutil.Debug("stun", "第三次绑定请求失败: %v", err)
+		logutil.Info("stun", "NAT 类型判定: port-restricted (公网地址: %s)", addr1)
+		return "port-restricted", addr1, conn, nil
+	}
+
+	logutil.Debug("stun", "新端口映射: %s (原端口: %s)", addr3, addr1)
+
+	if !addr1.IP.Equal(addr3.IP) {
+		logutil.Debug("stun", "不同本地端口映射到不同IP，判定为 symmetric")
+		logutil.Info("stun", "NAT 类型判定: symmetric (公网地址: %s)", addr1)
+		return "symmetric", addr1, conn, nil
+	}
+
+	portDiff := addr3.Port - addr1.Port
+	if portDiff < 0 {
+		portDiff = -portDiff
+	}
+
+	if portDiff <= 2 {
+		logutil.Debug("stun", "端口增量很小 (%d)，可能为 Port Restricted Cone", portDiff)
+		logutil.Info("stun", "NAT 类型判定: port-restricted (公网地址: %s)", addr1)
+		logutil.Info("stun", "提示: 如确认为 Full Cone，请使用 -nat-type full-cone 覆盖")
+		return "port-restricted", addr1, conn, nil
+	}
+
+	logutil.Debug("stun", "端口增量较大 (%d)，保守判定为 port-restricted", portDiff)
+	logutil.Info("stun", "NAT 类型判定: port-restricted (公网地址: %s)", addr1)
+	logutil.Info("stun", "提示: 如确认为 Full Cone，请使用 -nat-type full-cone 覆盖")
+	return "port-restricted", addr1, conn, nil
 }
 
 func isLocalPortChanged(mapped *Addr, local *net.UDPAddr) bool {

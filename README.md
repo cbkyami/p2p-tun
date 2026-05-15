@@ -49,10 +49,6 @@ go build -o signal-server ./signal-server/
 GOOS=linux GOARCH=amd64 go build -o signal-server-linux ./signal-server/
 ```
 
-### Download Pre-built Binaries
-
-Download from [Releases](https://github.com/cbkyami/p2p-tun/releases) page.
-
 ## Quick Start
 
 ### 1. Start Relay Server (on your VPS)

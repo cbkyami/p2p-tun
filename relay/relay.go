@@ -50,6 +50,7 @@ type Client struct {
 	writeMu                   sync.Mutex
 	nextID                    uint32
 	closeCh                   chan struct{}
+	disconnectedCh            chan struct{}
 	serverSupportsCompression bool
 }
 
@@ -108,6 +109,7 @@ func (c *Client) Connect() error {
 	c.udpChannels = make(map[uint32]net.Conn)
 	c.connInfos = make(map[uint32]*ConnInfo)
 	c.closeCh = make(chan struct{})
+	c.disconnectedCh = make(chan struct{})
 
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
@@ -188,6 +190,10 @@ func (c *Client) Close() error {
 		return c.conn.Close()
 	}
 	return nil
+}
+
+func (c *Client) Disconnected() <-chan struct{} {
+	return c.disconnectedCh
 }
 
 func (c *Client) GetConnections() []ConnInfo {
@@ -278,7 +284,29 @@ func (c *Client) readControl() (*controlMsg, error) {
 }
 
 func (c *Client) readLoop() {
-	defer c.Close()
+	defer func() {
+		c.mu.Lock()
+		for id, conn := range c.channels {
+			conn.Close()
+			delete(c.channels, id)
+			logutil.AddActiveChan(-1)
+		}
+		for id, conn := range c.udpChannels {
+			conn.Close()
+			delete(c.udpChannels, id)
+			logutil.AddActiveChan(-1)
+		}
+		for id := range c.connInfos {
+			delete(c.connInfos, id)
+		}
+		c.mu.Unlock()
+
+		select {
+		case <-c.closeCh:
+		default:
+			close(c.disconnectedCh)
+		}
+	}()
 
 	for {
 		select {
@@ -589,8 +617,8 @@ func isClosedErr(err error) bool {
 	return false
 }
 
+var globalChannelID uint32
+
 func NextChannelID() uint32 {
-	var id uint32
-	atomic.AddUint32(&id, 1)
-	return id
+	return atomic.AddUint32(&globalChannelID, 1)
 }

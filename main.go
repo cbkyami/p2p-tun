@@ -23,10 +23,33 @@ import (
 	"p2p_tun/plugin"
 	"p2p_tun/relay"
 	"p2p_tun/stun"
-	"p2p_tun/upnp"
 )
 
 const version = "v2.1"
+
+type stunFlag struct {
+	enabled bool
+	server  string
+}
+
+func (f *stunFlag) IsBoolFlag() bool { return true }
+
+func (f *stunFlag) String() string {
+	if !f.enabled {
+		return ""
+	}
+	return f.server
+}
+
+func (f *stunFlag) Set(value string) error {
+	f.enabled = true
+	if value == "" || value == "true" {
+		f.server = "stun.l.google.com:19302"
+	} else {
+		f.server = value
+	}
+	return nil
+}
 
 type AppStatus struct {
 	Running        bool               `json:"running"`
@@ -48,6 +71,7 @@ var (
 	appStatus    AppStatus
 	relayClient  *relay.Client
 	stopCh       chan struct{}
+	relayMu      sync.RWMutex
 	statusMu     sync.RWMutex
 	guiToken     string
 	authKeyVal   string
@@ -160,8 +184,10 @@ func protoEnabled(proto, want string) bool {
 func main() {
 	localPorts := flag.String("local", "8080", "本地服务端口，多个用逗号分隔，如 8080,22,3306")
 	preferPorts := flag.String("port", "0", "期望的公网端口，多个用逗号分隔，0=自动匹配local")
-	upnpFlag := flag.Bool("upnp", false, "启用 UPnP 端口映射（默认关闭）")
-	stunServer := flag.String("stun", "", "STUN 服务器地址，留空则不使用 STUN（如 stun.l.google.com:19302）")
+	stunFlagVar := &stunFlag{}
+	flag.Var(stunFlagVar, "stun", "启用 STUN 探测，可指定服务器地址（默认 stun.l.google.com:19302）")
+	stunServer2 := flag.String("stun2", "stun1.l.google.com:19302", "第二个 STUN 服务器（用于 NAT 类型检测，默认 stun1.l.google.com:19302）")
+	natTypeOverride := flag.String("nat-type", "", "手动指定 NAT 类型覆盖检测结果 (full-cone/restricted/port-restricted/symmetric)")
 	relayServer := flag.String("relay", "", "中继服务器地址 ip:port")
 	proto := flag.String("proto", "tcp", "协议 tcp/udp/both（both 表示同时启用 TCP 和 UDP）")
 	verboseFlag := flag.Bool("verbose", false, "输出详细调试日志")
@@ -195,20 +221,25 @@ func main() {
 	maxConnsVal = *maxConns
 	rateLimitVal = *rateLimit
 
+	stunServerStr := ""
+	if stunFlagVar.enabled {
+		stunServerStr = stunFlagVar.server
+	}
+
 	logutil.Info("main", "p2p-tun %s 启动", version)
-	logutil.Info("main", "参数: local=%s, port=%s, upnp=%v, stun=%s, relay=%s, proto=%s, verbose=%v, gui=%v",
-		*localPorts, *preferPorts, *upnpFlag, *stunServer, *relayServer, *proto, *verboseFlag, *guiFlag)
+	logutil.Info("main", "参数: local=%s, port=%s, stun=%s, relay=%s, proto=%s, verbose=%v, gui=%v",
+		*localPorts, *preferPorts, stunServerStr, *relayServer, *proto, *verboseFlag, *guiFlag)
 
 	appStatus.LocalPorts = *localPorts
 
 	if *guiFlag {
 		startGUI()
 	} else {
-		runCLI(*localPorts, *preferPorts, *upnpFlag, *stunServer, *relayServer, *proto)
+		runCLI(*localPorts, *preferPorts, stunServerStr, *stunServer2, *natTypeOverride, *relayServer, *proto)
 	}
 }
 
-func runCLI(localPortsStr, preferPortsStr string, upnpEnabled bool, stunServer, relayServer, proto string) {
+func runCLI(localPortsStr, preferPortsStr string, stunServer, stunServer2, natTypeOverride, relayServer, proto string) {
 	stopCh = make(chan struct{})
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -220,81 +251,25 @@ func runCLI(localPortsStr, preferPortsStr string, upnpEnabled bool, stunServer, 
 		os.Exit(0)
 	}()
 
-	runTunnel(localPortsStr, preferPortsStr, upnpEnabled, stunServer, relayServer, proto, compressVal, ipAllowVal, ipDenyVal, maxConnsVal, rateLimitVal)
+	runTunnel(localPortsStr, preferPortsStr, stunServer, stunServer2, natTypeOverride, relayServer, proto, compressVal, ipAllowVal, ipDenyVal, maxConnsVal, rateLimitVal)
 }
 
-func runTunnel(localPortsStr, preferPortsStr string, upnpEnabled bool, stunServer, relayServer, proto string, compress bool, ipAllow, ipDeny string, maxConns int, rateLimit int64) {
+func runTunnel(localPortsStr, preferPortsStr string, stunServer, stunServer2, natTypeOverride, relayServer, proto string, compress bool, ipAllow, ipDeny string, maxConns int, rateLimit int64) {
 	localPorts := parsePorts(localPortsStr)
 	preferPorts := parsePorts(preferPortsStr)
 
-	if upnpEnabled {
-		logutil.Info("main", "进入第一层: 尝试 UPnP")
-		gw, err := upnp.DiscoverGateway()
-		if err == nil {
-			publicIP, err := gw.GetExternalIP()
-			if err == nil {
-				allOK := true
-				var mappedPorts []string
-				for _, currentProto := range []string{"tcp", "udp"} {
-					if !protoEnabled(proto, currentProto) {
-						continue
-					}
-					for i, lp := range localPorts {
-						extPort := lp
-						if i < len(preferPorts) && preferPorts[i] != 0 {
-							extPort = preferPorts[i]
-						}
-						err = gw.AddPortMapping(extPort, lp, strings.ToUpper(currentProto), "p2p-tun")
-						if err != nil {
-							allOK = false
-							break
-						}
-						mappedPorts = append(mappedPorts, fmt.Sprintf("%s:%d/%s->%d", publicIP, extPort, strings.ToUpper(currentProto), lp))
-						defer gw.DeletePortMapping(extPort, strings.ToUpper(currentProto))
-					}
-					if !allOK {
-						break
-					}
-				}
-				if allOK && len(mappedPorts) > 0 {
-					publicAddr := strings.Join(mappedPorts, ", ")
-					logutil.Info("main", "UPnP 映射成功: %s", publicAddr)
-					appStatus.SetRunning("upnp", publicAddr)
-
-					for _, currentProto := range []string{"tcp", "udp"} {
-						if !protoEnabled(proto, currentProto) {
-							continue
-						}
-						for i, lp := range localPorts {
-							extPort := lp
-							if i < len(preferPorts) && preferPorts[i] != 0 {
-								extPort = preferPorts[i]
-							}
-							listenAddr := ":" + strconv.Itoa(extPort)
-							targetAddr := "127.0.0.1:" + strconv.Itoa(lp)
-							if currentProto == "tcp" {
-								go forward.ForwardTCP(listenAddr, targetAddr)
-							} else {
-								go forward.ForwardUDP(listenAddr, targetAddr)
-							}
-						}
-					}
-
-					select {}
-				}
-			}
-		}
-		logutil.Info("main", "UPnP 失败: %v", err)
-	}
-
 	if stunServer != "" {
-		logutil.Info("main", "进入第二层: STUN 探测 NAT 类型")
-		natType, publicAddr, stunConn, err := stun.DetectNATType(stunServer)
+		logutil.Info("main", "进入第一层: STUN 探测 NAT 类型")
+		natType, publicAddr, stunConn, err := stun.DetectNATType(stunServer, stunServer2)
 		if err != nil {
 			logutil.Info("main", "STUN 探测失败: %v", err)
 			appStatus.SetNATType("unknown")
 			stunConn = nil
 		} else {
+			if natTypeOverride != "" {
+				logutil.Info("main", "用户覆盖 NAT 类型: %s -> %s", natType, natTypeOverride)
+				natType = natTypeOverride
+			}
 			appStatus.SetNATType(natType)
 			logutil.Info("main", "NAT 类型: %s, 公网地址: %s", natType, publicAddr)
 
@@ -323,7 +298,7 @@ func runTunnel(localPortsStr, preferPortsStr string, upnpEnabled bool, stunServe
 
 				select {}
 			}
-			logutil.Info("main", "NAT 类型 %s，不适合直连", natType)
+			logutil.Info("main", "NAT 类型 %s，不适合直连，将使用中继模式", natType)
 		}
 
 		if stunConn != nil {
@@ -331,7 +306,7 @@ func runTunnel(localPortsStr, preferPortsStr string, upnpEnabled bool, stunServe
 		}
 	}
 
-	logutil.Info("main", "进入第三层: 公网 VPS 中继")
+	logutil.Info("main", "进入第二层: 公网 VPS 中继")
 	if relayServer == "" {
 		errMsg := "需要提供公网中继服务器地址，使用 -relay ip:port 参数"
 		logutil.Error("main", "%s", errMsg)
@@ -367,29 +342,67 @@ func runTunnel(localPortsStr, preferPortsStr string, upnpEnabled bool, stunServe
 		logutil.Info("main", "数据压缩已启用 (lz4, min_size=128)")
 	}
 
-	relayClient = &relay.Client{
-		ServerAddr: relayServer,
-		AuthKey:    authKeyVal,
-		Services:   services,
-		Compressor: compressor,
-		IPAllow:    ipAllow,
-		IPDeny:     ipDeny,
-		MaxConns:   maxConns,
-		RateLimit:  rateLimit,
-	}
+	retryDelay := 3
+	maxRetryDelay := 60
 
-	logutil.Info("main", "使用中继模式")
-	if err := relayClient.Connect(); err != nil {
-		logutil.Error("main", "中继连接失败: %v", err)
-		appStatus.SetStopped(err.Error())
-		return
-	}
+	for {
+		client := &relay.Client{
+			ServerAddr: relayServer,
+			AuthKey:    authKeyVal,
+			Services:   services,
+			Compressor: compressor,
+			IPAllow:    ipAllow,
+			IPDeny:     ipDeny,
+			MaxConns:   maxConns,
+			RateLimit:  rateLimit,
+		}
+		relayMu.Lock()
+		relayClient = client
+		relayMu.Unlock()
 
-	publicAddrStr := relayServer
-	appStatus.SetRunning("relay", publicAddrStr)
+		logutil.Info("main", "使用中继模式")
+		if err := client.Connect(); err != nil {
+			logutil.Error("main", "中继连接失败: %v，%d秒后重试...", err, retryDelay)
+			appStatus.SetStopped(fmt.Sprintf("连接失败，%d秒后重试", retryDelay))
 
-	if stopCh != nil {
-		<-stopCh
+			select {
+			case <-stopCh:
+				return
+			case <-time.After(time.Duration(retryDelay) * time.Second):
+			}
+
+			retryDelay *= 2
+			if retryDelay > maxRetryDelay {
+				retryDelay = maxRetryDelay
+			}
+			continue
+		}
+
+		retryDelay = 3
+
+		publicAddrStr := relayServer
+		appStatus.SetRunning("relay", publicAddrStr)
+
+		select {
+		case <-stopCh:
+			client.Close()
+			return
+		case <-client.Disconnected():
+			logutil.Info("main", "中继连接断开，%d秒后重连...", retryDelay)
+			client.Close()
+			appStatus.SetStopped("连接断开，准备重连")
+
+			select {
+			case <-stopCh:
+				return
+			case <-time.After(time.Duration(retryDelay) * time.Second):
+			}
+
+			retryDelay *= 2
+			if retryDelay > maxRetryDelay {
+				retryDelay = maxRetryDelay
+			}
+		}
 	}
 }
 
@@ -457,8 +470,11 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	data["bytes_in"] = logutil.GetBytesIn()
 	data["bytes_out"] = logutil.GetBytesOut()
 	data["active_channels"] = logutil.GetActiveChans()
-	if relayClient != nil {
-		data["total_conns"] = relayClient.GetTotalConns()
+	relayMu.RLock()
+	rc := relayClient
+	relayMu.RUnlock()
+	if rc != nil {
+		data["total_conns"] = rc.GetTotalConns()
 	} else {
 		data["total_conns"] = int64(0)
 	}
@@ -472,17 +488,18 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var params struct {
-		LocalPorts  string `json:"local_ports"`
-		RemotePorts string `json:"remote_ports"`
-		Upnp        bool   `json:"upnp"`
-		StunServer  string `json:"stun_server"`
-		RelayAddr   string `json:"relay_addr"`
-		Proto       string `json:"proto"`
-		Compress    bool   `json:"compress"`
-		IPAllow     string `json:"ip_allow"`
-		IPDeny      string `json:"ip_deny"`
-		MaxConns    int    `json:"max_conns"`
-		RateLimit   int64  `json:"rate_limit"`
+		LocalPorts     string `json:"local_ports"`
+		RemotePorts    string `json:"remote_ports"`
+		StunServer     string `json:"stun_server"`
+		StunServer2    string `json:"stun_server2"`
+		NatTypeOverride string `json:"nat_type_override"`
+		RelayAddr      string `json:"relay_addr"`
+		Proto          string `json:"proto"`
+		Compress       bool   `json:"compress"`
+		IPAllow        string `json:"ip_allow"`
+		IPDeny         string `json:"ip_deny"`
+		MaxConns       int    `json:"max_conns"`
+		RateLimit      int64  `json:"rate_limit"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
 		http.Error(w, err.Error(), 400)
@@ -511,7 +528,7 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 	appStatus.LocalPorts = params.LocalPorts
 	appStatus.mu.Unlock()
 
-	go runTunnel(params.LocalPorts, params.RemotePorts, params.Upnp, params.StunServer, params.RelayAddr, params.Proto, params.Compress, params.IPAllow, params.IPDeny, params.MaxConns, params.RateLimit)
+	go runTunnel(params.LocalPorts, params.RemotePorts, params.StunServer, params.StunServer2, params.NatTypeOverride, params.RelayAddr, params.Proto, params.Compress, params.IPAllow, params.IPDeny, params.MaxConns, params.RateLimit)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "started"})
@@ -523,6 +540,7 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	relayMu.Lock()
 	if stopCh != nil {
 		close(stopCh)
 		stopCh = make(chan struct{})
@@ -531,6 +549,7 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 		relayClient.Close()
 		relayClient = nil
 	}
+	relayMu.Unlock()
 
 	appStatus.SetStopped("stopped by user")
 
@@ -552,11 +571,14 @@ func handleTraffic(w http.ResponseWriter, r *http.Request) {
 
 func handleConnections(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if relayClient == nil {
+	relayMu.RLock()
+	rc := relayClient
+	relayMu.RUnlock()
+	if rc == nil {
 		json.NewEncoder(w).Encode([]interface{}{})
 		return
 	}
-	conns := relayClient.GetConnections()
+	conns := rc.GetConnections()
 	type connOutput struct {
 		ChannelID   uint32 `json:"channel_id"`
 		RemoteAddr  string `json:"remote_addr"`
@@ -614,8 +636,9 @@ var helpText = `p2p-tun v2.1 - NAT 穿透工具
 选项:
   -local string      本地服务端口，多个用逗号分隔 (默认 "8080")
   -port string       期望的公网端口，多个用逗号分隔，0=自动匹配local (默认 "0")
-  -upnp              启用 UPnP 端口映射 (默认关闭)
-  -stun string       STUN 服务器地址，留空则不使用 STUN (如 stun.l.google.com:19302)
+  -stun              启用 STUN 探测，可指定服务器 (默认 stun.l.google.com:19302)
+  -stun2 string      第二个 STUN 服务器 (用于 NAT 类型检测，默认 "stun1.l.google.com:19302")
+  -nat-type string   手动指定 NAT 类型覆盖检测结果 (full-cone/restricted/port-restricted/symmetric)
   -relay string      中继服务器地址 ip:port
   -proto string      协议 tcp/udp/both (默认 "tcp")
   -auth-key string   中继认证密钥，需与服务端一致
@@ -629,21 +652,28 @@ var helpText = `p2p-tun v2.1 - NAT 穿透工具
   -gui-token string  GUI 认证 token，留空则自动生成
   -help              显示此帮助
 
+NAT 类型说明:
+  full-cone        全锥形 NAT (Net1) - 任何外部主机都可发送，适合直连
+  restricted       受限锥形 NAT (Net2) - 只有发送过数据的外部IP可发送
+  port-restricted  端口受限锥形 NAT (Net3) - 只有发送过数据的外部IP:Port可发送
+  symmetric        对称 NAT (Net4) - 不同目标不同映射
+
 穿透流程:
   默认: 直接使用中继服务器
-  -upnp 开启: UPnP → 中继
   -stun 设置: STUN → 中继
-  两者都开启: UPnP → STUN → 中继
 
 示例:
-  # 基本用法（直接中继）
+  # 基本用法（直接中继，不进行 STUN 探测）
   p2p-tun.exe -local 8080 -relay myvps.com:9000
 
-  # 启用 UPnP
-  p2p-tun.exe -local 8080 -relay myvps.com:9000 -upnp
+  # 启用 STUN（使用默认服务器）
+  p2p-tun.exe -local 8080 -relay myvps.com:9000 -stun
 
-  # 启用 STUN
-  p2p-tun.exe -local 8080 -relay myvps.com:9000 -stun stun.l.google.com:19302
+  # 启用 STUN（指定服务器）
+  p2p-tun.exe -local 8080 -relay myvps.com:9000 -stun 192.168.1.1:3478
+
+  # 手动指定 NAT 类型（如检测结果不准确）
+  p2p-tun.exe -local 8080 -stun -nat-type full-cone
 
   # 多端口
   p2p-tun.exe -local 8080,22,3306 -port 8080,22,3306 -relay myvps.com:9000
@@ -818,27 +848,14 @@ body { font-family: 'Fira Sans', sans-serif; }
             class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
                    focus:outline-none focus:border-accent transition-colors duration-200">
         </div>
-        <div class="grid grid-cols-2 gap-3">
+        <div>
           <div class="flex items-center justify-between bg-bg border border-border rounded-lg px-3 py-2">
             <div>
-              <div class="text-[10px] text-dim">UPnP</div>
-              <div class="text-[9px] text-dim">端口映射</div>
+              <div class="text-[10px] text-dim">STUN 探测</div>
+              <div class="text-[9px] text-dim">stun.l.google.com</div>
             </div>
             <label class="relative inline-flex items-center cursor-pointer">
-              <input type="checkbox" id="upnpToggle" class="sr-only peer">
-              <div class="w-9 h-5 bg-border rounded-full peer peer-checked:bg-accent
-                          after:content-[''] after:absolute after:top-[2px] after:left-[2px]
-                          after:bg-white after:rounded-full after:h-4 after:w-4
-                          after:transition-all peer-checked:after:translate-x-full"></div>
-            </label>
-          </div>
-          <div class="flex items-center justify-between bg-bg border border-border rounded-lg px-3 py-2">
-            <div>
-              <div class="text-[10px] text-dim">压缩</div>
-              <div class="text-[9px] text-dim">lz4</div>
-            </div>
-            <label class="relative inline-flex items-center cursor-pointer">
-              <input type="checkbox" id="compressToggle" class="sr-only peer">
+              <input type="checkbox" id="stunToggle" class="sr-only peer">
               <div class="w-9 h-5 bg-border rounded-full peer peer-checked:bg-accent
                           after:content-[''] after:absolute after:top-[2px] after:left-[2px]
                           after:bg-white after:rounded-full after:h-4 after:w-4
@@ -846,45 +863,61 @@ body { font-family: 'Fira Sans', sans-serif; }
             </label>
           </div>
         </div>
-        <div>
-          <label class="block text-[10px] text-dim mb-1">STUN 服务器 (留空=不使用)</label>
-          <input type="text" id="stunServer" placeholder="stun.l.google.com:19302"
-            class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
-                   focus:outline-none focus:border-accent transition-colors duration-200">
-        </div>
-        <div>
-          <label class="block text-[10px] text-dim mb-1">协议</label>
-          <select id="proto"
-            class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
-                   focus:outline-none focus:border-accent transition-colors duration-200">
-            <option value="tcp">TCP</option>
-            <option value="udp">UDP</option>
-            <option value="both">TCP + UDP</option>
-          </select>
-        </div>
-        <div>
-          <label class="block text-[10px] text-dim mb-1">IP 白名单</label>
-          <input type="text" id="ipAllow" placeholder="1.2.3.0/24"
-            class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
-                   focus:outline-none focus:border-accent transition-colors duration-200">
-        </div>
-        <div>
-          <label class="block text-[10px] text-dim mb-1">IP 黑名单</label>
-          <input type="text" id="ipDeny" placeholder="10.0.0.0/8"
-            class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
-                   focus:outline-none focus:border-accent transition-colors duration-200">
-        </div>
-        <div>
-          <label class="block text-[10px] text-dim mb-1">最大连接数</label>
-          <input type="number" id="maxConns" placeholder="0" min="0"
-            class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
-                   focus:outline-none focus:border-accent transition-colors duration-200">
-        </div>
-        <div>
-          <label class="block text-[10px] text-dim mb-1">带宽限制 B/s</label>
-          <input type="number" id="rateLimit" placeholder="0" min="0"
-            class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
-                   focus:outline-none focus:border-accent transition-colors duration-200">
+      </div>
+      <div class="mt-3">
+        <button onclick="toggleAdvanced()" class="flex items-center gap-1 text-[10px] text-dim hover:text-muted transition-colors cursor-pointer">
+          <svg id="advArrow" class="w-3 h-3 transition-transform duration-200" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+          高级设置
+        </button>
+        <div id="advancedPanel" class="hidden space-y-3 mt-2">
+          <div>
+            <label class="block text-[10px] text-dim mb-1">协议</label>
+            <select id="proto"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
+                     focus:outline-none focus:border-accent transition-colors duration-200">
+              <option value="tcp">TCP</option>
+              <option value="udp">UDP</option>
+              <option value="both">TCP + UDP</option>
+            </select>
+          </div>
+          <div>
+            <div class="flex items-center justify-between bg-bg border border-border rounded-lg px-3 py-2">
+              <div class="text-[10px] text-dim">压缩 (lz4)</div>
+              <label class="relative inline-flex items-center cursor-pointer">
+                <input type="checkbox" id="compressToggle" class="sr-only peer">
+                <div class="w-9 h-5 bg-border rounded-full peer peer-checked:bg-accent
+                            after:content-[''] after:absolute after:top-[2px] after:left-[2px]
+                            after:bg-white after:rounded-full after:h-4 after:w-4
+                            after:transition-all peer-checked:after:translate-x-full"></div>
+              </label>
+            </div>
+          </div>
+          <div>
+            <label class="block text-[10px] text-dim mb-1">IP 白名单</label>
+            <input type="text" id="ipAllow" placeholder="1.2.3.0/24"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
+                     focus:outline-none focus:border-accent transition-colors duration-200">
+          </div>
+          <div>
+            <label class="block text-[10px] text-dim mb-1">IP 黑名单</label>
+            <input type="text" id="ipDeny" placeholder="10.0.0.0/8"
+              class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
+                     focus:outline-none focus:border-accent transition-colors duration-200">
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-[10px] text-dim mb-1">最大连接</label>
+              <input type="number" id="maxConns" placeholder="0" min="0"
+                class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
+                       focus:outline-none focus:border-accent transition-colors duration-200">
+            </div>
+            <div>
+              <label class="block text-[10px] text-dim mb-1">带宽 B/s</label>
+              <input type="number" id="rateLimit" placeholder="0" min="0"
+                class="w-full bg-bg border border-border rounded-lg px-3 py-2 text-xs font-mono text-txt
+                       focus:outline-none focus:border-accent transition-colors duration-200">
+            </div>
+          </div>
         </div>
       </div>
       <div class="flex gap-3 mt-5">
@@ -1212,12 +1245,25 @@ function updateConnections() {
   }).catch(function(){});
 }
 
+function toggleAdvanced() {
+  var panel = document.getElementById('advancedPanel');
+  var arrow = document.getElementById('advArrow');
+  if (panel.classList.contains('hidden')) {
+    panel.classList.remove('hidden');
+    arrow.style.transform = 'rotate(90deg)';
+  } else {
+    panel.classList.add('hidden');
+    arrow.style.transform = 'rotate(0deg)';
+  }
+}
+
 function startTunnel() {
+  var stunEnabled = document.getElementById('stunToggle').checked;
   var params = {
     local_ports: document.getElementById('localPorts').value || '8080',
     remote_ports: document.getElementById('remotePorts').value || '0',
-    upnp: document.getElementById('upnpToggle').checked,
-    stun_server: document.getElementById('stunServer').value,
+    stun_server: stunEnabled ? 'stun.l.google.com:19302' : '',
+    stun_server2: stunEnabled ? 'stun1.l.google.com:19302' : '',
     relay_addr: document.getElementById('relayAddr').value,
     proto: document.getElementById('proto').value,
     compress: document.getElementById('compressToggle').checked,

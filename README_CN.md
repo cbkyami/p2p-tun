@@ -49,10 +49,6 @@ go build -o signal-server ./signal-server/
 GOOS=linux GOARCH=amd64 go build -o signal-server-linux ./signal-server/
 ```
 
-### 下载预编译二进制
-
-从 [Releases](https://github.com/cbkyami/p2p-tun/releases) 页面下载。
-
 ## 快速开始
 
 ### 1. 启动中继服务器（在 VPS 上）

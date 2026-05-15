@@ -896,10 +896,11 @@ func udpReadLoop(conn *net.UDPConn, client *relayClient, svc serviceMapping) {
 			continue
 		}
 
+		if globalRateLimiter != nil {
+			globalRateLimiter.Wait(n)
+		}
 		if client.rateLimiter != nil {
 			client.rateLimiter.Wait(n)
-		} else if globalRateLimiter != nil {
-			globalRateLimiter.Wait(n)
 		}
 
 		data := make([]byte, n)
@@ -983,10 +984,11 @@ func pipeExternalToClient(extConn net.Conn, client *relayClient, channelID uint3
 			return
 		}
 
+		if globalRateLimiter != nil {
+			globalRateLimiter.Wait(n)
+		}
 		if client.rateLimiter != nil {
 			client.rateLimiter.Wait(n)
-		} else if globalRateLimiter != nil {
-			globalRateLimiter.Wait(n)
 		}
 
 		data := make([]byte, n)
@@ -1073,10 +1075,11 @@ func relayReadLoop(conn net.Conn, client *relayClient, cid uint32) {
 				continue
 			}
 
+			if globalRateLimiter != nil {
+				globalRateLimiter.Wait(len(data))
+			}
 			if client.rateLimiter != nil {
 				client.rateLimiter.Wait(len(data))
-			} else if globalRateLimiter != nil {
-				globalRateLimiter.Wait(len(data))
 			}
 
 			client.chanMu.RLock()

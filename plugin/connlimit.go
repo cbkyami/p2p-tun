@@ -18,18 +18,23 @@ func (l *ConnLimit) OnAccept(proto string, addr net.Addr) bool {
 	if l.maxConns <= 0 {
 		return true
 	}
-	for {
-		cur := atomic.LoadInt32(&l.current)
-		if cur >= l.maxConns {
-			return false
-		}
-		if atomic.CompareAndSwapInt32(&l.current, cur, cur+1) {
-			return true
-		}
-	}
+	cur := atomic.LoadInt32(&l.current)
+	return cur < l.maxConns
 }
 
 func (l *ConnLimit) OnOpen() {
+	if l.maxConns <= 0 {
+		return
+	}
+	for {
+		cur := atomic.LoadInt32(&l.current)
+		if cur >= l.maxConns {
+			return
+		}
+		if atomic.CompareAndSwapInt32(&l.current, cur, cur+1) {
+			return
+		}
+	}
 }
 
 func (l *ConnLimit) OnClose() {
