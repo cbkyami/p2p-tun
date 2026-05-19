@@ -29,17 +29,24 @@ type ServiceMap struct {
 	LocalPort  int    `json:"local_port"`
 	RemotePort int    `json:"remote_port"`
 	Proto      string `json:"proto"`
+	TargetHost string `json:"target_host,omitempty"`
+	Compress   bool   `json:"compress,omitempty"`
+	IPAllow    string `json:"ip_allow,omitempty"`
+	IPDeny     string `json:"ip_deny,omitempty"`
+	MaxConns   int    `json:"max_conns,omitempty"`
+	RateLimit  int64  `json:"rate_limit,omitempty"`
 }
 
 type Client struct {
-	ServerAddr string
-	AuthKey    string
-	Services   []ServiceMap
-	Compressor *plugin.Compression
-	IPAllow    string
-	IPDeny     string
-	MaxConns   int
-	RateLimit  int64
+	ServerAddr  string
+	AuthKey     string
+	Services    []ServiceMap
+	Compressor  *plugin.Compression
+	IPAllow     string
+	IPDeny      string
+	MaxConns    int
+	RateLimit   int64
+	TargetHosts map[int]string
 
 	conn                      net.Conn
 	channels                  map[uint32]net.Conn
@@ -52,24 +59,26 @@ type Client struct {
 	closeCh                   chan struct{}
 	disconnectedCh            chan struct{}
 	serverSupportsCompression bool
+	svcCompress               map[int]bool
 }
 
 type controlMsg struct {
-	Type           string       `json:"type"`
-	ChannelID      uint32       `json:"channel_id,omitempty"`
-	LocalPort      int          `json:"local_port,omitempty"`
-	RemotePort     int          `json:"remote_port,omitempty"`
-	Proto          string       `json:"proto,omitempty"`
-	PublicAddr     string       `json:"public_addr,omitempty"`
-	RemoteAddr     string       `json:"remote_addr,omitempty"`
-	Services       []ServiceMap `json:"services,omitempty"`
-	AuthKey        string       `json:"auth_key,omitempty"`
-	FailedServices []ServiceMap `json:"failed_services,omitempty"`
-	Features       []string     `json:"features,omitempty"`
-	IPAllow        string       `json:"ip_allow,omitempty"`
-	IPDeny         string       `json:"ip_deny,omitempty"`
-	MaxConns       int          `json:"max_conns,omitempty"`
-	RateLimit      int64        `json:"rate_limit,omitempty"`
+	Type             string       `json:"type"`
+	ChannelID        uint32       `json:"channel_id,omitempty"`
+	LocalPort        int          `json:"local_port,omitempty"`
+	RemotePort       int          `json:"remote_port,omitempty"`
+	Proto            string       `json:"proto,omitempty"`
+	PublicAddr       string       `json:"public_addr,omitempty"`
+	RemoteAddr       string       `json:"remote_addr,omitempty"`
+	Services         []ServiceMap `json:"services,omitempty"`
+	AuthKey          string       `json:"auth_key,omitempty"`
+	FailedServices   []ServiceMap `json:"failed_services,omitempty"`
+	AssignedServices []ServiceMap `json:"assigned_services,omitempty"`
+	Features         []string     `json:"features,omitempty"`
+	IPAllow          string       `json:"ip_allow,omitempty"`
+	IPDeny           string       `json:"ip_deny,omitempty"`
+	MaxConns         int          `json:"max_conns,omitempty"`
+	RateLimit        int64        `json:"rate_limit,omitempty"`
 }
 
 const (
@@ -97,6 +106,16 @@ func frameTypeName(t byte) string {
 	}
 }
 
+func (c *Client) targetAddr(localPort int) string {
+	host := "127.0.0.1"
+	if c.TargetHosts != nil {
+		if h, ok := c.TargetHosts[localPort]; ok && h != "" {
+			host = h
+		}
+	}
+	return host + ":" + strconv.Itoa(localPort)
+}
+
 func (c *Client) Connect() error {
 	logutil.Info("relay", "连接到中继服务器 %s", c.ServerAddr)
 
@@ -110,6 +129,12 @@ func (c *Client) Connect() error {
 	c.connInfos = make(map[uint32]*ConnInfo)
 	c.closeCh = make(chan struct{})
 	c.disconnectedCh = make(chan struct{})
+	c.svcCompress = make(map[int]bool)
+	for _, svc := range c.Services {
+		if svc.Compress {
+			c.svcCompress[svc.LocalPort] = true
+		}
+	}
 
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
@@ -165,13 +190,25 @@ func (c *Client) Connect() error {
 		c.Compressor = nil
 	}
 
+	if len(resp.AssignedServices) > 0 {
+		c.Services = resp.AssignedServices
+	}
+
 	logutil.Info("relay", "注册成功, 公网地址: %s", resp.PublicAddr)
 	for _, svc := range c.Services {
-		logutil.Info("relay", "端口映射: VPS:%d -> 本地:%d (%s)", svc.RemotePort, svc.LocalPort, svc.Proto)
+		targetHost := svc.TargetHost
+		if targetHost == "" {
+			targetHost = "127.0.0.1"
+		}
+		logutil.Info("relay", "端口映射: VPS:%d -> %s:%d (%s)", svc.RemotePort, targetHost, svc.LocalPort, svc.Proto)
 	}
 	if len(resp.FailedServices) > 0 {
 		for _, svc := range resp.FailedServices {
 			logutil.Error("relay", "服务启动失败: VPS:%d -> 本地:%d (%s) — 服务端无法监听此端口", svc.RemotePort, svc.LocalPort, svc.Proto)
+		}
+		if len(resp.AssignedServices) == 0 {
+			c.conn.Close()
+			return fmt.Errorf("所有端口启动失败，需要重连")
 		}
 	}
 
@@ -414,7 +451,7 @@ func (c *Client) handleControl(msg controlMsg) {
 func (c *Client) handleNewConn(channelID uint32, localPort int, remoteAddr string) {
 	logutil.Debug("relay", "收到 new_conn: channel_id=%d, local_port=%d, remote=%s", channelID, localPort, remoteAddr)
 
-	targetAddr := "127.0.0.1:" + strconv.Itoa(localPort)
+	targetAddr := c.targetAddr(localPort)
 	localConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 	if err != nil {
 		logutil.Error("relay", "连接本地服务 %s 失败: %v", targetAddr, err)
@@ -450,7 +487,7 @@ func (c *Client) handleNewConn(channelID uint32, localPort int, remoteAddr strin
 func (c *Client) handleNewUDPConn(channelID uint32, localPort int, remoteAddr string) {
 	logutil.Debug("relay", "收到 new_udp_conn: channel_id=%d, local_port=%d, remote=%s", channelID, localPort, remoteAddr)
 
-	targetAddr := "127.0.0.1:" + strconv.Itoa(localPort)
+	targetAddr := c.targetAddr(localPort)
 	localConn, err := net.Dial("udp", targetAddr)
 	if err != nil {
 		logutil.Error("relay", "连接本地 UDP %s 失败: %v", targetAddr, err)
@@ -521,7 +558,17 @@ func (c *Client) pipeLocalToRelay(channelID uint32, localConn net.Conn) {
 		copy(data, buf[:n])
 
 		ft := byte(frameData)
-		if c.Compressor != nil && c.serverSupportsCompression {
+		shouldCompress := c.Compressor != nil && c.serverSupportsCompression
+		if !shouldCompress {
+			c.mu.RLock()
+			if info, ok := c.connInfos[channelID]; ok {
+				if svcCompress, ok2 := c.svcCompress[info.LocalPort]; ok2 && svcCompress {
+					shouldCompress = c.serverSupportsCompression
+				}
+			}
+			c.mu.RUnlock()
+		}
+		if shouldCompress && c.Compressor != nil {
 			compressed, ok := c.Compressor.Compress(data)
 			if ok {
 				data = compressed

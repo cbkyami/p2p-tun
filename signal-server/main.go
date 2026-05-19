@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -52,6 +53,16 @@ type relayClient struct {
 	ipFilter     *plugin.IPFilter
 	connLimiter  *plugin.ConnLimit
 	rateLimiter  *plugin.RateLimit
+	clientKey    string
+	svcFilters   map[int]*svcFilter
+	chanSvcPort  map[uint32]int
+}
+
+type svcFilter struct {
+	ipFilter    *plugin.IPFilter
+	connLimiter *plugin.ConnLimit
+	rateLimiter *plugin.RateLimit
+	compress    bool
 }
 
 func (c *relayClient) stop() {
@@ -64,24 +75,32 @@ type serviceMapping struct {
 	LocalPort  int    `json:"local_port"`
 	RemotePort int    `json:"remote_port"`
 	Proto      string `json:"proto"`
+	TargetHost string `json:"target_host,omitempty"`
+	Compress   bool   `json:"compress,omitempty"`
+	IPAllow    string `json:"ip_allow,omitempty"`
+	IPDeny     string `json:"ip_deny,omitempty"`
+	MaxConns   int    `json:"max_conns,omitempty"`
+	RateLimit  int64  `json:"rate_limit,omitempty"`
 }
 
 type controlMsg struct {
-	Type           string           `json:"type"`
-	ChannelID      uint32           `json:"channel_id,omitempty"`
-	LocalPort      int              `json:"local_port,omitempty"`
-	RemotePort     int              `json:"remote_port,omitempty"`
-	Proto          string           `json:"proto,omitempty"`
-	PublicAddr     string           `json:"public_addr,omitempty"`
-	RemoteAddr     string           `json:"remote_addr,omitempty"`
-	Services       []serviceMapping `json:"services,omitempty"`
-	AuthKey        string           `json:"auth_key,omitempty"`
-	FailedServices []serviceMapping `json:"failed_services,omitempty"`
-	Features       []string         `json:"features,omitempty"`
-	IPAllow        string           `json:"ip_allow,omitempty"`
-	IPDeny         string           `json:"ip_deny,omitempty"`
-	MaxConns       int              `json:"max_conns,omitempty"`
-	RateLimit      int64            `json:"rate_limit,omitempty"`
+	Type             string           `json:"type"`
+	ChannelID        uint32           `json:"channel_id,omitempty"`
+	LocalPort        int              `json:"local_port,omitempty"`
+	RemotePort       int              `json:"remote_port,omitempty"`
+	Proto            string           `json:"proto,omitempty"`
+	PublicAddr       string           `json:"public_addr,omitempty"`
+	RemoteAddr       string           `json:"remote_addr,omitempty"`
+	Services         []serviceMapping `json:"services,omitempty"`
+	AuthKey          string           `json:"auth_key,omitempty"`
+	FailedServices   []serviceMapping `json:"failed_services,omitempty"`
+	AssignedServices []serviceMapping `json:"assigned_services,omitempty"`
+	ClientKey        string           `json:"client_key,omitempty"`
+	Features         []string         `json:"features,omitempty"`
+	IPAllow          string           `json:"ip_allow,omitempty"`
+	IPDeny           string           `json:"ip_deny,omitempty"`
+	MaxConns         int              `json:"max_conns,omitempty"`
+	RateLimit        int64            `json:"rate_limit,omitempty"`
 }
 
 const (
@@ -95,7 +114,19 @@ const (
 
 	stunMagicCookie = 0x2112A442
 	bindingRequest  = 0x0001
+
+	randomPortMin = 32000
+	randomPortMax = 33000
+
+	portHoldDuration = 30 * time.Second
 )
+
+type heldPort struct {
+	Port       int
+	Proto      string
+	ReleasedAt time.Time
+	ClientKey  string
+}
 
 var (
 	clients           = make(map[uint32]*relayClient)
@@ -103,6 +134,8 @@ var (
 	nextCID           uint32
 	listeners         = make(map[int]net.Listener)
 	listenMu          sync.Mutex
+	heldPorts         []heldPort
+	heldMu            sync.Mutex
 	serverCfg         Config
 	verbose           bool
 	pluginMgr         *plugin.Manager
@@ -124,6 +157,58 @@ func isNormalClose(err error) bool {
 	return strings.Contains(s, "use of closed network connection") ||
 		strings.Contains(s, "connection reset by peer") ||
 		strings.Contains(s, "broken pipe")
+}
+
+func allocateRandomPort() int {
+	for i := 0; i < 100; i++ {
+		port := randomPortMin + rand.Intn(randomPortMax-randomPortMin+1)
+		listenMu.Lock()
+		if _, exists := listeners[port]; !exists {
+			listenMu.Unlock()
+			return port
+		}
+		listenMu.Unlock()
+	}
+	return randomPortMin
+}
+
+func holdPortsForClient(clientKey string, svcs []serviceMapping) {
+	heldMu.Lock()
+	defer heldMu.Unlock()
+	now := time.Now()
+	for _, svc := range svcs {
+		heldPorts = append(heldPorts, heldPort{
+			Port:       svc.RemotePort,
+			Proto:      svc.Proto,
+			ReleasedAt: now,
+			ClientKey:  clientKey,
+		})
+	}
+}
+
+func findHeldPort(clientKey string, localPort int, proto string) (int, bool) {
+	heldMu.Lock()
+	defer heldMu.Unlock()
+	cleanExpiredHeldLocked()
+	for i, hp := range heldPorts {
+		if hp.ClientKey == clientKey && hp.Proto == proto {
+			heldPorts = append(heldPorts[:i], heldPorts[i+1:]...)
+			return hp.Port, true
+		}
+	}
+	return 0, false
+}
+
+func cleanExpiredHeldLocked() {
+	now := time.Now()
+	i := 0
+	for i < len(heldPorts) {
+		if now.Sub(heldPorts[i].ReleasedAt) > portHoldDuration {
+			heldPorts = append(heldPorts[:i], heldPorts[i+1:]...)
+		} else {
+			i++
+		}
+	}
 }
 
 func logDebug(module, format string, args ...interface{}) {
@@ -174,6 +259,8 @@ func clientSupportsCompression(client *relayClient) bool {
 }
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	flag.Usage = func() {
 		fmt.Print(serverHelpText)
 	}
@@ -483,6 +570,8 @@ func handleRelayClient(conn net.Conn) {
 		cid:          cid,
 		udpConns:     make(map[int]*net.UDPConn),
 		udpSessions:  make(map[string]*udpSession),
+		svcFilters:   make(map[int]*svcFilter),
+		chanSvcPort:  make(map[uint32]int),
 	}
 
 	logInfo("server", "新客户端连接, client_id=%d, 来源: %s", cid, conn.RemoteAddr())
@@ -552,6 +641,12 @@ func handleRelayClient(conn net.Conn) {
 	client.services = msg.Services
 	client.features = msg.Features
 
+	clientKey := msg.ClientKey
+	if clientKey == "" {
+		clientKey = msg.AuthKey + "@" + conn.RemoteAddr().String()
+	}
+	client.clientKey = clientKey
+
 	if msg.IPAllow != "" || msg.IPDeny != "" {
 		ipf, err := plugin.NewIPFilter(msg.IPAllow, msg.IPDeny)
 		if err != nil {
@@ -572,6 +667,40 @@ func handleRelayClient(conn net.Conn) {
 		logInfo("server", "客户端 %d 自定义带宽限制: %d bytes/s", cid, msg.RateLimit)
 	}
 
+	for _, svc := range msg.Services {
+		sf := &svcFilter{}
+		hasOverride := false
+
+		if svc.IPAllow != "" || svc.IPDeny != "" {
+			ipf, err := plugin.NewIPFilter(svc.IPAllow, svc.IPDeny)
+			if err != nil {
+				logWarn("server", "客户端 %d 服务 :%d IP 过滤规则无效: %v", cid, svc.RemotePort, err)
+			} else {
+				sf.ipFilter = ipf
+				hasOverride = true
+			}
+		}
+
+		if svc.MaxConns > 0 {
+			sf.connLimiter = plugin.NewConnLimit(svc.MaxConns)
+			hasOverride = true
+		}
+
+		if svc.RateLimit > 0 {
+			sf.rateLimiter = plugin.NewRateLimit(svc.RateLimit)
+			hasOverride = true
+		}
+
+		if svc.Compress {
+			sf.compress = true
+			hasOverride = true
+		}
+
+		if hasOverride {
+			client.svcFilters[svc.RemotePort] = sf
+		}
+	}
+
 	logInfo("server", "客户端注册, client_id=%d, 服务列表:", cid)
 	for _, svc := range msg.Services {
 		logInfo("server", "  remote_port=%d -> local_port=%d (%s)", svc.RemotePort, svc.LocalPort, svc.Proto)
@@ -584,13 +713,23 @@ func handleRelayClient(conn net.Conn) {
 
 	var clientListeners []net.Listener
 	var failedServices []serviceMapping
+	var assignedServices []serviceMapping
 	for _, svc := range msg.Services {
-		ln, err := startServiceListener(svc, client, publicIP)
+		if svc.RemotePort == 0 {
+			if heldPort, found := findHeldPort(clientKey, svc.LocalPort, svc.Proto); found {
+				svc.RemotePort = heldPort
+				logInfo("server", "复用保留端口: %d (client_key=%s, local_port=%d, proto=%s)", heldPort, clientKey, svc.LocalPort, svc.Proto)
+			}
+		}
+		ln, assigned, err := startServiceListener(svc, client, publicIP)
 		if err != nil {
 			failedServices = append(failedServices, svc)
 			logWarn("server", "服务启动失败: :%d/%s -> :%d, 错误: %v", svc.RemotePort, svc.Proto, svc.LocalPort, err)
-		} else if ln != nil {
-			clientListeners = append(clientListeners, ln)
+		} else {
+			assignedServices = append(assignedServices, assigned)
+			if ln != nil {
+				clientListeners = append(clientListeners, ln)
+			}
 		}
 	}
 
@@ -600,10 +739,11 @@ func handleRelayClient(conn net.Conn) {
 	}
 
 	okResp := controlMsg{
-		Type:           "ok",
-		PublicAddr:     publicIP,
-		FailedServices: failedServices,
-		Features:       serverFeatures,
+		Type:             "ok",
+		PublicAddr:       publicIP,
+		FailedServices:   failedServices,
+		AssignedServices: assignedServices,
+		Features:         serverFeatures,
 	}
 	if err := sendControl(conn, okResp); err != nil {
 		logError("server", "发送 ok 失败 client_id=%d: %v", cid, err)
@@ -630,6 +770,7 @@ func handleRelayClient(conn net.Conn) {
 	relayReadLoop(conn, client, cid)
 
 	client.stop()
+	holdPortsForClient(client.clientKey, client.services)
 	for _, l := range clientListeners {
 		l.Close()
 		listenMu.Lock()
@@ -659,40 +800,48 @@ func handleRelayClient(conn net.Conn) {
 	logInfo("server", "客户端断开, client_id=%d", cid)
 }
 
-func startServiceListener(svc serviceMapping, client *relayClient, publicIP string) (net.Listener, error) {
+func startServiceListener(svc serviceMapping, client *relayClient, publicIP string) (net.Listener, serviceMapping, error) {
 	if svc.Proto == "udp" {
-		err := startUDPService(svc, client)
-		return nil, err
+		result, err := startUDPService(svc, client)
+		return nil, result, err
 	}
 	if svc.Proto == "tcp" {
 		return startTCPService(svc, client)
 	}
-	return nil, fmt.Errorf("unsupported proto: %s", svc.Proto)
+	return nil, svc, fmt.Errorf("unsupported proto: %s", svc.Proto)
 }
 
-func startTCPService(svc serviceMapping, client *relayClient) (net.Listener, error) {
-	listenMu.Lock()
-	if _, exists := listeners[svc.RemotePort]; exists {
-		listenMu.Unlock()
-		logWarn("server", "端口 %d 已被占用", svc.RemotePort)
-		return nil, fmt.Errorf("port %d already in use", svc.RemotePort)
+func startTCPService(svc serviceMapping, client *relayClient) (net.Listener, serviceMapping, error) {
+	actualPort := svc.RemotePort
+	if actualPort == 0 {
+		actualPort = allocateRandomPort()
 	}
 
-	ln, err := net.Listen("tcp", ":"+strconv.Itoa(svc.RemotePort))
+	listenMu.Lock()
+	if _, exists := listeners[actualPort]; exists {
+		listenMu.Unlock()
+		logWarn("server", "端口 %d 已被占用", actualPort)
+		return nil, svc, fmt.Errorf("port %d already in use", actualPort)
+	}
+
+	ln, err := listenTCP(":" + strconv.Itoa(actualPort))
 	if err != nil {
 		listenMu.Unlock()
-		logError("server", "监听 :%d 失败: %v", svc.RemotePort, err)
-		return nil, err
+		logError("server", "监听 :%d 失败: %v", actualPort, err)
+		return nil, svc, err
 	}
-	listeners[svc.RemotePort] = ln
+	listeners[actualPort] = ln
 	listenMu.Unlock()
 
-	logInfo("server", "TCP 服务监听启动: :%d -> 客户端本地 :%d", svc.RemotePort, svc.LocalPort)
+	result := svc
+	result.RemotePort = actualPort
+
+	logInfo("server", "TCP 服务监听启动: :%d -> 客户端本地 :%d", actualPort, svc.LocalPort)
 
 	go func() {
 		defer func() {
 			listenMu.Lock()
-			delete(listeners, svc.RemotePort)
+			delete(listeners, actualPort)
 			listenMu.Unlock()
 			ln.Close()
 		}()
@@ -710,7 +859,7 @@ func startTCPService(svc serviceMapping, client *relayClient) (net.Listener, err
 				case <-client.stopCh:
 					return
 				default:
-					logError("server", "Accept :%d 错误: %v", svc.RemotePort, err)
+					logError("server", "Accept :%d 错误: %v", actualPort, err)
 					return
 				}
 			}
@@ -720,14 +869,25 @@ func startTCPService(svc serviceMapping, client *relayClient) (net.Listener, err
 				extConn.Close()
 				continue
 			}
-			if client.ipFilter != nil && !client.ipFilter.OnAccept("tcp", extConn.RemoteAddr()) {
+			ipf := client.ipFilter
+			cl := client.connLimiter
+			if sf, ok := client.svcFilters[actualPort]; ok {
+				if sf.ipFilter != nil {
+					ipf = sf.ipFilter
+				}
+				if sf.connLimiter != nil {
+					cl = sf.connLimiter
+				}
+			}
+
+			if ipf != nil && !ipf.OnAccept("tcp", extConn.RemoteAddr()) {
 				logWarn("server", "IP 过滤拒绝(客户端规则): %s", extConn.RemoteAddr())
 				extConn.Close()
 				continue
 			}
 
-			if client.connLimiter != nil && !client.connLimiter.OnAccept("tcp", extConn.RemoteAddr()) {
-				logWarn("server", "连接数限制拒绝: %s (当前 %d/%d)", extConn.RemoteAddr(), client.connLimiter.Current(), client.connLimiter.Max())
+			if cl != nil && !cl.OnAccept("tcp", extConn.RemoteAddr()) {
+				logWarn("server", "连接数限制拒绝: %s (当前 %d/%d)", extConn.RemoteAddr(), cl.Current(), cl.Max())
 				extConn.Close()
 				continue
 			}
@@ -738,20 +898,21 @@ func startTCPService(svc serviceMapping, client *relayClient) (net.Listener, err
 
 			client.chanMu.Lock()
 			client.channelConns[channelID] = extConn
+			client.chanSvcPort[channelID] = actualPort
 			client.chanMu.Unlock()
 
 			action := pluginMgr.OnOpen("tcp", extConn.RemoteAddr().String(), channelID, svc.LocalPort)
 			if action.Close {
 				logInfo("server", "插件要求断开连接: channel=%d, 原因: %s", channelID, action.Reason)
 				pluginMgr.OnClose(channelID)
-				if client.connLimiter != nil {
-					client.connLimiter.OnClose()
+				if cl != nil {
+					cl.OnClose()
 				}
 				extConn.Close()
 				return
 			}
-			if client.connLimiter != nil {
-				client.connLimiter.OnOpen()
+			if cl != nil {
+				cl.OnOpen()
 			}
 
 			newConnMsg := controlMsg{
@@ -778,31 +939,39 @@ func startTCPService(svc serviceMapping, client *relayClient) (net.Listener, err
 		}
 	}()
 
-	return ln, nil
+	return ln, result, nil
 }
 
-func startUDPService(svc serviceMapping, client *relayClient) error {
-	addr, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(svc.RemotePort))
+func startUDPService(svc serviceMapping, client *relayClient) (serviceMapping, error) {
+	actualPort := svc.RemotePort
+	if actualPort == 0 {
+		actualPort = allocateRandomPort()
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(actualPort))
 	if err != nil {
-		return err
+		return svc, err
 	}
 
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		logError("server", "UDP 监听 :%d 失败: %v", svc.RemotePort, err)
-		return err
+		logError("server", "UDP 监听 :%d 失败: %v", actualPort, err)
+		return svc, err
 	}
 
+	result := svc
+	result.RemotePort = actualPort
+
 	client.udpMu.Lock()
-	client.udpConns[svc.RemotePort] = conn
+	client.udpConns[actualPort] = conn
 	client.udpMu.Unlock()
 
-	logInfo("server", "UDP 服务监听启动: :%d -> 客户端本地 :%d", svc.RemotePort, svc.LocalPort)
+	logInfo("server", "UDP 服务监听启动: :%d -> 客户端本地 :%d", actualPort, svc.LocalPort)
 
-	go udpReadLoop(conn, client, svc)
+	go udpReadLoop(conn, client, result)
 	go udpSessionCleanup(client)
 
-	return nil
+	return result, nil
 }
 
 func udpReadLoop(conn *net.UDPConn, client *relayClient, svc serviceMapping) {
@@ -833,8 +1002,20 @@ func udpReadLoop(conn *net.UDPConn, client *relayClient, svc serviceMapping) {
 			logDebug("server", "IP 过滤拒绝 UDP(全局): %s", remoteAddr)
 			continue
 		}
-		if client.ipFilter != nil && !client.ipFilter.OnAccept("udp", remoteAddr) {
-			logDebug("server", "IP 过滤拒绝 UDP(客户端规则): %s", remoteAddr)
+
+		ipf := client.ipFilter
+		cl := client.connLimiter
+		if sf, ok := client.svcFilters[svc.RemotePort]; ok {
+			if sf.ipFilter != nil {
+				ipf = sf.ipFilter
+			}
+			if sf.connLimiter != nil {
+				cl = sf.connLimiter
+			}
+		}
+
+		if ipf != nil && !ipf.OnAccept("udp", remoteAddr) {
+			logDebug("server", "IP 过滤拒绝 UDP(服务规则): %s", remoteAddr)
 			continue
 		}
 
@@ -843,8 +1024,8 @@ func udpReadLoop(conn *net.UDPConn, client *relayClient, svc serviceMapping) {
 		client.udpMu.Lock()
 		session, exists := client.udpSessions[sessionKey]
 		if !exists {
-			if client.connLimiter != nil && !client.connLimiter.OnAccept("udp", remoteAddr) {
-				logDebug("server", "连接数限制拒绝 UDP: %s (当前 %d/%d)", remoteAddr, client.connLimiter.Current(), client.connLimiter.Max())
+			if cl != nil && !cl.OnAccept("udp", remoteAddr) {
+				logDebug("server", "连接数限制拒绝 UDP: %s (当前 %d/%d)", remoteAddr, cl.Current(), cl.Max())
 				client.udpMu.Unlock()
 				continue
 			}
@@ -856,18 +1037,20 @@ func udpReadLoop(conn *net.UDPConn, client *relayClient, svc serviceMapping) {
 				lastActive: time.Now(),
 			}
 			client.udpSessions[sessionKey] = session
+			client.chanSvcPort[session.channelID] = svc.RemotePort
 
 			action := pluginMgr.OnOpen("udp", sessionKey, session.channelID, svc.LocalPort)
 			if action.Close {
 				logInfo("server", "插件要求断开连接: channel=%d, 原因: %s", session.channelID, action.Reason)
 				delete(client.udpSessions, sessionKey)
-				if client.connLimiter != nil {
-					client.connLimiter.OnClose()
+				delete(client.chanSvcPort, session.channelID)
+				if cl != nil {
+					cl.OnClose()
 				}
 				continue
 			}
-			if client.connLimiter != nil {
-				client.connLimiter.OnOpen()
+			if cl != nil {
+				cl.OnOpen()
 			}
 
 			newConnMsg := controlMsg{
@@ -888,10 +1071,11 @@ func udpReadLoop(conn *net.UDPConn, client *relayClient, svc serviceMapping) {
 			logInfo("server", "插件要求断开连接: channel=%d, 原因: %s", session.channelID, action.Reason)
 			client.udpMu.Lock()
 			delete(client.udpSessions, sessionKey)
+			delete(client.chanSvcPort, session.channelID)
 			client.udpMu.Unlock()
 			pluginMgr.OnClose(session.channelID)
-			if client.connLimiter != nil {
-				client.connLimiter.OnClose()
+			if cl != nil {
+				cl.OnClose()
 			}
 			continue
 		}
@@ -899,8 +1083,14 @@ func udpReadLoop(conn *net.UDPConn, client *relayClient, svc serviceMapping) {
 		if globalRateLimiter != nil {
 			globalRateLimiter.Wait(n)
 		}
-		if client.rateLimiter != nil {
-			client.rateLimiter.Wait(n)
+		rl := client.rateLimiter
+		if svcPort, ok := client.chanSvcPort[session.channelID]; ok {
+			if sf, ok2 := client.svcFilters[svcPort]; ok2 && sf.rateLimiter != nil {
+				rl = sf.rateLimiter
+			}
+		}
+		if rl != nil {
+			rl.Wait(n)
 		}
 
 		data := make([]byte, n)
@@ -938,10 +1128,16 @@ func udpSessionCleanup(client *relayClient) {
 				if now.Sub(sess.lastActive) > 120*time.Second {
 					client.writeFrameLocked(frameClose, sess.channelID, nil)
 					pluginMgr.OnClose(sess.channelID)
-					if client.connLimiter != nil {
-						client.connLimiter.OnClose()
+					svcPort, _ := client.chanSvcPort[sess.channelID]
+					cl := client.connLimiter
+					if sf, ok := client.svcFilters[svcPort]; ok && sf.connLimiter != nil {
+						cl = sf.connLimiter
+					}
+					if cl != nil {
+						cl.OnClose()
 					}
 					delete(client.udpSessions, key)
+					delete(client.chanSvcPort, sess.channelID)
 					logDebug("server", "UDP session 超时清理: %s", key)
 				}
 			}
@@ -956,11 +1152,17 @@ func pipeExternalToClient(extConn net.Conn, client *relayClient, channelID uint3
 		client.chanMu.Lock()
 		_, existed := client.channelConns[channelID]
 		delete(client.channelConns, channelID)
+		svcPort, _ := client.chanSvcPort[channelID]
+		delete(client.chanSvcPort, channelID)
 		client.chanMu.Unlock()
 		if existed {
 			pluginMgr.OnClose(channelID)
-			if client.connLimiter != nil {
-				client.connLimiter.OnClose()
+			cl := client.connLimiter
+			if sf, ok := client.svcFilters[svcPort]; ok && sf.connLimiter != nil {
+				cl = sf.connLimiter
+			}
+			if cl != nil {
+				cl.OnClose()
 			}
 		}
 	}()
@@ -987,8 +1189,14 @@ func pipeExternalToClient(extConn net.Conn, client *relayClient, channelID uint3
 		if globalRateLimiter != nil {
 			globalRateLimiter.Wait(n)
 		}
-		if client.rateLimiter != nil {
-			client.rateLimiter.Wait(n)
+		rl2 := client.rateLimiter
+		if svcPort, ok := client.chanSvcPort[channelID]; ok {
+			if sf, ok2 := client.svcFilters[svcPort]; ok2 && sf.rateLimiter != nil {
+				rl2 = sf.rateLimiter
+			}
+		}
+		if rl2 != nil {
+			rl2.Wait(n)
 		}
 
 		data := make([]byte, n)
@@ -1066,11 +1274,17 @@ func relayReadLoop(conn net.Conn, client *relayClient, cid uint32) {
 				if ec, ok := client.channelConns[channelID]; ok {
 					ec.Close()
 				}
+				svcPort, _ := client.chanSvcPort[channelID]
 				delete(client.channelConns, channelID)
+				delete(client.chanSvcPort, channelID)
 				client.chanMu.Unlock()
 				pluginMgr.OnClose(channelID)
-				if client.connLimiter != nil {
-					client.connLimiter.OnClose()
+				cl := client.connLimiter
+				if sf, ok := client.svcFilters[svcPort]; ok && sf.connLimiter != nil {
+					cl = sf.connLimiter
+				}
+				if cl != nil {
+					cl.OnClose()
 				}
 				continue
 			}
@@ -1078,8 +1292,14 @@ func relayReadLoop(conn net.Conn, client *relayClient, cid uint32) {
 			if globalRateLimiter != nil {
 				globalRateLimiter.Wait(len(data))
 			}
-			if client.rateLimiter != nil {
-				client.rateLimiter.Wait(len(data))
+			rl3 := client.rateLimiter
+			if svcPort, ok := client.chanSvcPort[channelID]; ok {
+				if sf, ok2 := client.svcFilters[svcPort]; ok2 && sf.rateLimiter != nil {
+					rl3 = sf.rateLimiter
+				}
+			}
+			if rl3 != nil {
+				rl3.Wait(len(data))
 			}
 
 			client.chanMu.RLock()
@@ -1115,16 +1335,24 @@ func relayReadLoop(conn net.Conn, client *relayClient, cid uint32) {
 		case frameClose:
 			client.chanMu.Lock()
 			extConn, tcpExisted := client.channelConns[channelID]
+			svcPort, svcPortOk := client.chanSvcPort[channelID]
 			if tcpExisted {
 				extConn.Close()
 				delete(client.channelConns, channelID)
+				delete(client.chanSvcPort, channelID)
 			}
 			client.chanMu.Unlock()
 
 			if tcpExisted {
 				pluginMgr.OnClose(channelID)
-				if client.connLimiter != nil {
-					client.connLimiter.OnClose()
+				cl := client.connLimiter
+				if svcPortOk {
+					if sf, ok := client.svcFilters[svcPort]; ok && sf.connLimiter != nil {
+						cl = sf.connLimiter
+					}
+				}
+				if cl != nil {
+					cl.OnClose()
 				}
 			}
 
@@ -1133,6 +1361,7 @@ func relayReadLoop(conn net.Conn, client *relayClient, cid uint32) {
 			for key, sess := range client.udpSessions {
 				if sess.channelID == channelID {
 					delete(client.udpSessions, key)
+					delete(client.chanSvcPort, channelID)
 					udpExisted = true
 					logDebug("server", "UDP session 关闭: %s, channel_id=%d", key, channelID)
 					break
@@ -1142,8 +1371,14 @@ func relayReadLoop(conn net.Conn, client *relayClient, cid uint32) {
 
 			if udpExisted {
 				pluginMgr.OnClose(channelID)
-				if client.connLimiter != nil {
-					client.connLimiter.OnClose()
+				cl := client.connLimiter
+				if svcPortOk {
+					if sf, ok := client.svcFilters[svcPort]; ok && sf.connLimiter != nil {
+						cl = sf.connLimiter
+					}
+				}
+				if cl != nil {
+					cl.OnClose()
 				}
 			}
 		}
