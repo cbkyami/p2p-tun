@@ -428,6 +428,7 @@ func runTunnel(localPortsStr, preferPortsStr, targetHostsStr, protosStr string, 
 				} else {
 					sm.RateLimit = rateLimit
 				}
+				sm.WebAuth = ov.WebAuth
 			} else {
 				sm.Compress = compress
 				sm.IPAllow = ipAllow
@@ -837,6 +838,7 @@ var helpText = `p2p-tun v2.1 - NAT 穿透工具
 
 用法:
   p2p-tun.exe [选项]
+  p2p-tun.exe -c config.toml
 
 选项:
   -c string         配置文件路径 (.toml)，使用配置文件模式启动
@@ -858,6 +860,28 @@ var helpText = `p2p-tun v2.1 - NAT 穿透工具
   -gui               启动 GUI 界面
   -gui-token string  GUI 认证 token，留空则自动生成
   -help              显示此帮助
+
+配置文件 (.toml) 格式:
+  relay = "vps:9000"          # 中继服务器地址 (必填)
+  auth_key = "mysecret"       # 中继认证密钥
+  compress = false            # 全局压缩开关
+  ip_allow = ""               # 全局 IP 白名单 (CIDR, 逗号分隔)
+  ip_deny = ""                # 全局 IP 黑名单 (CIDR, 逗号分隔)
+  max_conns = 0               # 全局最大并发连接数，0=不限
+  rate_limit = 0              # 全局带宽限制 (字节/秒)，0=不限
+  verbose = true              # 详细日志
+
+  [[service]]
+  local = "8080"              # 本地服务端口
+  port = "18080"              # 公网端口，0=自动分配
+  target = "127.0.0.1"        # 目标主机 (默认 127.0.0.1)
+  proto = "tcp"               # 协议 tcp/udp/both
+  compress = true             # 覆盖全局压缩设置
+  ip_allow = "1.2.3.0/24"    # 覆盖全局 IP 白名单 (与全局拼接)
+  ip_deny = "10.0.0.0/8"     # 覆盖全局 IP 黑名单 (与全局拼接)
+  max_conns = 10              # 覆盖全局最大连接数
+  rate_limit = 102400         # 覆盖全局带宽限制
+  web_auth = "mypassword"     # Web 访问认证密码 (Cookie 登录页，有效期 3 小时)
 
 NAT 类型说明:
   full-cone        全锥形 NAT (Net1) - 任何外部主机都可发送，适合直连
@@ -890,6 +914,9 @@ NAT 类型说明:
 
   # 带认证
   p2p-tun.exe -local 8080 -relay myvps.com:9000 -auth-key mysecret123
+
+  # 配置文件模式 (支持 per-service 覆盖)
+  p2p-tun.exe -c config.toml
 
   # GUI 模式
   p2p-tun.exe -gui

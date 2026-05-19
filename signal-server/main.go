@@ -1,6 +1,12 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	_ "embed"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -9,6 +15,8 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -21,6 +29,9 @@ import (
 	"p2p_tun/dynplugin"
 	"p2p_tun/plugin"
 )
+
+//go:embed auth_bg.webp
+var authBgData []byte
 
 type Config struct {
 	STUNPort   int
@@ -63,6 +74,21 @@ type svcFilter struct {
 	connLimiter *plugin.ConnLimit
 	rateLimiter *plugin.RateLimit
 	compress    bool
+	webAuth     *webAuthConfig
+}
+
+type webAuthConfig struct {
+	password string
+	port     int
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (bc *bufferedConn) Read(b []byte) (int, error) {
+	return bc.reader.Read(b)
 }
 
 func (c *relayClient) stop() {
@@ -81,6 +107,7 @@ type serviceMapping struct {
 	IPDeny     string `json:"ip_deny,omitempty"`
 	MaxConns   int    `json:"max_conns,omitempty"`
 	RateLimit  int64  `json:"rate_limit,omitempty"`
+	WebAuth    string `json:"web_auth,omitempty"`
 }
 
 type controlMsg struct {
@@ -696,6 +723,14 @@ func handleRelayClient(conn net.Conn) {
 			hasOverride = true
 		}
 
+		if svc.WebAuth != "" {
+			sf.webAuth = &webAuthConfig{
+				password: svc.WebAuth,
+				port:     svc.RemotePort,
+			}
+			hasOverride = true
+		}
+
 		if hasOverride {
 			client.svcFilters[svc.RemotePort] = sf
 		}
@@ -811,6 +846,122 @@ func startServiceListener(svc serviceMapping, client *relayClient, publicIP stri
 	return nil, svc, fmt.Errorf("unsupported proto: %s", svc.Proto)
 }
 
+const webAuthCookieName = "p2p_auth"
+const webAuthMaxAge = 10800
+
+func generateAuthCookieValue(password string, port int) string {
+	ts := time.Now().Unix()
+	tsStr := strconv.FormatInt(ts, 16)
+	mac := hmac.New(sha256.New, []byte(password))
+	mac.Write([]byte(tsStr))
+	mac.Write([]byte(strconv.Itoa(port)))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return tsStr + "." + sig
+}
+
+func validateAuthCookieValue(cookieValue, password string, port int) bool {
+	parts := strings.SplitN(cookieValue, ".", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	ts, err := strconv.ParseInt(parts[0], 16, 64)
+	if err != nil {
+		return false
+	}
+	if time.Now().Unix()-ts > webAuthMaxAge {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(password))
+	mac.Write([]byte(parts[0]))
+	mac.Write([]byte(strconv.Itoa(port)))
+	expectedSig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(parts[1]), []byte(expectedSig))
+}
+
+func handleWebAuth(extConn net.Conn, wa *webAuthConfig) (net.Conn, bool) {
+	extConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	var rawBuf bytes.Buffer
+	teeReader := io.TeeReader(extConn, &rawBuf)
+	br := bufio.NewReaderSize(teeReader, 4096)
+
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		extConn.SetReadDeadline(time.Time{})
+		extConn.Close()
+		return nil, false
+	}
+
+	extConn.SetReadDeadline(time.Time{})
+
+	if cookie, err := req.Cookie(webAuthCookieName); err == nil {
+		if validateAuthCookieValue(cookie.Value, wa.password, wa.port) {
+			var replay bytes.Buffer
+			req.Write(&replay)
+			if req.Body != nil {
+				io.Copy(&replay, req.Body)
+				req.Body.Close()
+			}
+			if br.Buffered() > 0 {
+				extra, _ := br.Peek(br.Buffered())
+				replay.Write(extra)
+			}
+			return &bufferedConn{
+				Conn:   extConn,
+				reader: io.MultiReader(bytes.NewReader(replay.Bytes()), extConn),
+			}, true
+		}
+	}
+
+	if req.Method == "POST" && req.URL.Path == "/__auth__" {
+		req.ParseForm()
+		password := req.FormValue("password")
+		redirect := req.FormValue("redirect")
+		if redirect == "" {
+			redirect = "/"
+		}
+		if redirectVal, err := url.Parse(redirect); err == nil {
+			if redirectVal.IsAbs() || !strings.HasPrefix(redirect, "/") {
+				redirect = "/"
+			}
+		} else {
+			redirect = "/"
+		}
+
+		if password == wa.password {
+			cookieValue := generateAuthCookieValue(wa.password, wa.port)
+			resp := fmt.Sprintf("HTTP/1.1 302 Found\r\nSet-Cookie: %s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Strict\r\nLocation: %s\r\nContent-Length: 0\r\n\r\n",
+				webAuthCookieName, cookieValue, webAuthMaxAge, redirect)
+			extConn.Write([]byte(resp))
+			extConn.Close()
+			return nil, false
+		}
+
+		resp := buildLoginPage(redirect, true)
+		extConn.Write([]byte(resp))
+		extConn.Close()
+		return nil, false
+	}
+
+	redirect := req.URL.RequestURI()
+	resp := buildLoginPage(redirect, false)
+	extConn.Write([]byte(resp))
+	extConn.Close()
+	return nil, false
+}
+
+func buildLoginPage(redirect string, wrongPassword bool) string {
+	errorMsg := ""
+	if wrongPassword {
+		errorMsg = `<p style="color:#ef4444;font-size:13px;margin:8px 0 0">密码错误，请重试</p>`
+	}
+	bgURI := "data:image/webp;base64," + base64.StdEncoding.EncodeToString(authBgData)
+	return "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" +
+		`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>认证</title><style>body{font-family:-apple-system,sans-serif;background:#0f172a url(` + bgURI + `) center/cover no-repeat;color:#f8fafc;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}.card{background:rgba(30,41,59,0.85);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid #334155;border-radius:12px;padding:32px;width:320px}h2{margin:0 0 8px;font-size:20px}p{color:#94a3b8;font-size:14px;margin:0 0 24px}input{width:100%;padding:10px 12px;background:#020617;border:1px solid #334155;border-radius:8px;color:#f8fafc;font-size:14px;box-sizing:border-box;outline:none}input:focus{border-color:#22c55e}button{width:100%;padding:10px;background:#22c55e;color:#020617;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;margin-top:16px}button:hover{background:#16a34a}</style></head><body><div class="card"><h2>&#x1f512; 访问认证</h2><p>此服务需要密码验证</p>` +
+		errorMsg +
+		`<form method="POST" action="/__auth__"><input type="hidden" name="redirect" value="` + redirect + `"><input type="password" name="password" placeholder="输入密码" autofocus><button type="submit">登录</button></form></div></body></html>`
+}
+
 func startTCPService(svc serviceMapping, client *relayClient) (net.Listener, serviceMapping, error) {
 	actualPort := svc.RemotePort
 	if actualPort == 0 {
@@ -890,6 +1041,14 @@ func startTCPService(svc serviceMapping, client *relayClient) (net.Listener, ser
 				logWarn("server", "连接数限制拒绝: %s (当前 %d/%d)", extConn.RemoteAddr(), cl.Current(), cl.Max())
 				extConn.Close()
 				continue
+			}
+
+			if sf, ok := client.svcFilters[actualPort]; ok && sf.webAuth != nil {
+				newConn, ok := handleWebAuth(extConn, sf.webAuth)
+				if !ok {
+					continue
+				}
+				extConn = newConn
 			}
 
 			channelID := atomic.AddUint32(&nextCID, 1)

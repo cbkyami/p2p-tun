@@ -9,23 +9,23 @@ import (
 )
 
 type TOMLConfig struct {
-	Local    string `toml:"local"`
-	Port     string `toml:"port"`
-	Target   string `toml:"target"`
-	Stun     string `toml:"stun"`
-	Stun2    string `toml:"stun2"`
-	NatType  string `toml:"nat_type"`
-	Relay    string `toml:"relay"`
-	Proto    string `toml:"proto"`
-	AuthKey  string `toml:"auth_key"`
-	Compress bool   `toml:"compress"`
-	IPAllow  string `toml:"ip_allow"`
-	IPDeny   string `toml:"ip_deny"`
-	MaxConns int    `toml:"max_conns"`
-	RateLimit int64 `toml:"rate_limit"`
-	Verbose  bool   `toml:"verbose"`
-	GUI      bool   `toml:"gui"`
-	GUIPort  int    `toml:"gui_port"`
+	Local     string `toml:"local"`
+	Port      string `toml:"port"`
+	Target    string `toml:"target"`
+	Stun      string `toml:"stun"`
+	Stun2     string `toml:"stun2"`
+	NatType   string `toml:"nat_type"`
+	Relay     string `toml:"relay"`
+	Proto     string `toml:"proto"`
+	AuthKey   string `toml:"auth_key"`
+	Compress  bool   `toml:"compress"`
+	IPAllow   string `toml:"ip_allow"`
+	IPDeny    string `toml:"ip_deny"`
+	MaxConns  int    `toml:"max_conns"`
+	RateLimit int64  `toml:"rate_limit"`
+	Verbose   bool   `toml:"verbose"`
+	GUI       bool   `toml:"gui"`
+	GUIPort   int    `toml:"gui_port"`
 
 	Service []TOMLService `toml:"service"`
 }
@@ -40,6 +40,7 @@ type TOMLService struct {
 	IPDeny    string `toml:"ip_deny"`
 	MaxConns  int    `toml:"max_conns"`
 	RateLimit int64  `toml:"rate_limit"`
+	WebAuth   string `toml:"web_auth"`
 }
 
 func loadTOMLConfig(path string) (*TOMLConfig, error) {
@@ -108,6 +109,7 @@ func (c *TOMLConfig) toParams() (localPortsStr, preferPortsStr, targetHostsStr, 
 				ov.RateLimit = svc.RateLimit
 				ov.HasRateLimit = true
 			}
+			ov.WebAuth = svc.WebAuth
 			serviceOverrides = append(serviceOverrides, ov)
 		}
 		if len(locals) == 0 {
@@ -178,6 +180,7 @@ type ServiceOverride struct {
 	HasMaxConns  bool
 	RateLimit    int64
 	HasRateLimit bool
+	WebAuth      string
 }
 
 func mergeIPLists(global, service string) string {

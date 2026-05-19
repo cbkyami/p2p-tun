@@ -35,6 +35,7 @@ type ServiceMap struct {
 	IPDeny     string `json:"ip_deny,omitempty"`
 	MaxConns   int    `json:"max_conns,omitempty"`
 	RateLimit  int64  `json:"rate_limit,omitempty"`
+	WebAuth    string `json:"web_auth,omitempty"`
 }
 
 type Client struct {
